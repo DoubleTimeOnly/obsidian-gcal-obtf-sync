@@ -188,15 +188,15 @@ export default class GoogleCalendarPlugin extends Plugin {
       });
 
       // Format events into a readable string
-      let eventText = `## Calendar Events for ${dateStr}\n\n`;
+      let eventText = `## ${dateStr}\n`;
       for (const item of allEvents) {
         const event = item.event;
         const startTime = event.start?.dateTime || event.start?.date || 'All day';
         const title = event.summary || '(No title)';
-        const description = event.description ? `\n  ${event.description}` : '';
-        const calendar = item.calendarLabel ? ` [${item.calendarLabel}]` : '';
+        const description = event.description ? `${event.description}\n` : '';
+        const calendar = item.calendarLabel ? `(${item.calendarLabel})` : '';
 
-        eventText += `- **${title}**${calendar} (${startTime})${description}\n`;
+        eventText += `**${calendar} ${title}**\n${description}`;
       }
 
       // Insert into the active note
