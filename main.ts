@@ -1,12 +1,17 @@
 import { App, Plugin, PluginSettingTab, Setting, Notice, Modal, requestUrl } from 'obsidian';
 
+interface Calendar {
+  id: string; // "primary" or specific calendar ID
+  label: string; // User-friendly name
+}
+
 interface GoogleCalendarSettings {
   clientId: string;
   clientSecret: string;
   refreshToken: string;
   accessToken: string;
   accessTokenExpiry: number; // timestamp in ms
-  calendarId: string; // "primary" or specific calendar ID
+  calendars: Calendar[]; // Array of calendars to sync
 }
 
 const DEFAULT_SETTINGS: GoogleCalendarSettings = {
@@ -15,7 +20,7 @@ const DEFAULT_SETTINGS: GoogleCalendarSettings = {
   refreshToken: '',
   accessToken: '',
   accessTokenExpiry: 0,
-  calendarId: 'primary',
+  calendars: [{ id: 'primary', label: 'Primary Calendar' }],
 };
 
 export default class GoogleCalendarPlugin extends Plugin {
@@ -103,50 +108,103 @@ export default class GoogleCalendarPlugin extends Plugin {
       return;
     }
 
+    if (!this.settings.calendars || this.settings.calendars.length === 0) {
+      new Notice('❌ No calendars configured. Please add at least one calendar in settings.');
+      return;
+    }
+
     // Build time bounds for the entire day (UTC)
     const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD
     const timeMin = `${dateStr}T00:00:00Z`;
     const timeMax = `${dateStr}T23:59:59Z`;
 
     try {
-      const response = await requestUrl({
-        url: `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(this.settings.calendarId)}/events` +
-             `?timeMin=${encodeURIComponent(timeMin)}` +
-             `&timeMax=${encodeURIComponent(timeMax)}` +
-             `&singleEvents=true` +
-             `&orderBy=startTime`,
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${this.settings.accessToken}`,
-        },
-      });
+      // Fetch events from all calendars
+      const allEvents: Array<{
+        event: any;
+        calendarLabel: string;
+        calendarIndex: number;
+        isAllDay: boolean;
+        startTime: Date | null;
+      }> = [];
 
-      const data = JSON.parse(response.text);
-      const events = data.items || [];
+      for (let calendarIndex = 0; calendarIndex < this.settings.calendars.length; calendarIndex++) {
+        const calendar = this.settings.calendars[calendarIndex];
+        try {
+          const response = await requestUrl({
+            url: `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendar.id)}/events` +
+                 `?timeMin=${encodeURIComponent(timeMin)}` +
+                 `&timeMax=${encodeURIComponent(timeMax)}` +
+                 `&singleEvents=true` +
+                 `&orderBy=startTime`,
+            method: 'GET',
+            headers: {
+              Authorization: `Bearer ${this.settings.accessToken}`,
+            },
+          });
 
-      if (events.length === 0) {
+          const data = JSON.parse(response.text);
+          const events = data.items || [];
+
+          for (const event of events) {
+            const isAllDay = !event.start?.dateTime; // All-day events have 'date' instead of 'dateTime'
+            const startTimeStr = event.start?.dateTime || event.start?.date;
+            const startTime = startTimeStr ? new Date(startTimeStr) : null;
+
+            allEvents.push({
+              event,
+              calendarLabel: calendar.label,
+              calendarIndex,
+              isAllDay,
+              startTime,
+            });
+          }
+        } catch (err) {
+          new Notice(`⚠️ Error fetching events from "${calendar.label}": ${err}`);
+        }
+      }
+
+      if (allEvents.length === 0) {
         new Notice(`No events on ${dateStr}`);
         return;
       }
 
+      // Sort events: all-day first, then by time, then by calendar order
+      allEvents.sort((a, b) => {
+        // 1. All-day events first
+        if (a.isAllDay !== b.isAllDay) {
+          return a.isAllDay ? -1 : 1;
+        }
+
+        // 2. Then by time (or maintain insertion order for all-day)
+        if (!a.isAllDay && !b.isAllDay && a.startTime && b.startTime) {
+          if (a.startTime.getTime() !== b.startTime.getTime()) {
+            return a.startTime.getTime() - b.startTime.getTime();
+          }
+        }
+
+        // 3. Finally by calendar order
+        return a.calendarIndex - b.calendarIndex;
+      });
+
       // Format events into a readable string
       let eventText = `## Calendar Events for ${dateStr}\n\n`;
-      for (const event of events) {
+      for (const item of allEvents) {
+        const event = item.event;
         const startTime = event.start?.dateTime || event.start?.date || 'All day';
-        const endTime = event.end?.dateTime || event.end?.date || '';
         const title = event.summary || '(No title)';
         const description = event.description ? `\n  ${event.description}` : '';
+        const calendar = item.calendarLabel ? ` [${item.calendarLabel}]` : '';
 
-        eventText += `- **${title}** (${startTime})${description}\n`;
+        eventText += `- **${title}**${calendar} (${startTime})${description}\n`;
       }
 
       // Insert into the active note
       const { MarkdownView } = require('obsidian');
-      const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+      const activeView = this.app.workspace.getActiveViewOfType(MarkdownView) as any;
       if (activeView) {
-        const editor = activeView.editor;
-        editor.replaceSelection(eventText);
-        new Notice(`✅ Inserted ${events.length} event(s)`);
+        activeView.editor.replaceSelection(eventText);
+        new Notice(`✅ Inserted ${allEvents.length} event(s) from ${this.settings.calendars.length} calendar(s)`);
       } else {
         new Notice('❌ No active note open');
       }
@@ -224,24 +282,99 @@ class GoogleCalendarSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName('Calendar ID')
-      .setDesc('Use "primary" for your main calendar, or paste a specific calendar ID')
-      .addText((text) =>
-        text
-          .setPlaceholder('primary')
-          .setValue(this.plugin.settings.calendarId)
-          .onChange(async (value) => {
-            this.plugin.settings.calendarId = value || 'primary';
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
       .setName('Token Status')
       .setDesc(
         this.plugin.settings.refreshToken
           ? `✅ Authenticated (expires ${new Date(this.plugin.settings.accessTokenExpiry).toLocaleString()})`
           : '❌ Not authenticated'
+      );
+
+    // Calendars section
+    containerEl.createEl('h3', { text: 'Calendars to Sync' });
+    containerEl.createEl('p', { text: 'Add Google Calendars to sync. Events will be ordered by calendar order below.' });
+
+    // Display existing calendars
+    if (this.plugin.settings.calendars && this.plugin.settings.calendars.length > 0) {
+      for (let i = 0; i < this.plugin.settings.calendars.length; i++) {
+        const calendar = this.plugin.settings.calendars[i];
+        const containerDiv = containerEl.createEl('div');
+        containerDiv.style.display = 'flex';
+        containerDiv.style.gap = '0.5rem';
+        containerDiv.style.marginBottom = '0.5rem';
+        containerDiv.style.alignItems = 'center';
+
+        // Calendar label input
+        const labelInput = containerDiv.createEl('input', { type: 'text' });
+        labelInput.value = calendar.label;
+        labelInput.style.flex = '1';
+        labelInput.placeholder = 'Calendar name';
+        labelInput.onchange = async () => {
+          this.plugin.settings.calendars[i].label = labelInput.value;
+          await this.plugin.saveSettings();
+        };
+
+        // Calendar ID input (read-only or editable)
+        const idInput = containerDiv.createEl('input', { type: 'text' });
+        idInput.value = calendar.id;
+        idInput.style.flex = '1.5';
+        idInput.placeholder = 'primary or calendar@gmail.com';
+        idInput.onchange = async () => {
+          this.plugin.settings.calendars[i].id = idInput.value;
+          await this.plugin.saveSettings();
+        };
+
+        // Move up button
+        const moveUpBtn = containerDiv.createEl('button', { text: '↑' });
+        moveUpBtn.style.padding = '0.25rem 0.5rem';
+        moveUpBtn.disabled = i === 0;
+        moveUpBtn.onclick = async () => {
+          if (i > 0) {
+            [this.plugin.settings.calendars[i], this.plugin.settings.calendars[i - 1]] = [
+              this.plugin.settings.calendars[i - 1],
+              this.plugin.settings.calendars[i],
+            ];
+            await this.plugin.saveSettings();
+            this.display();
+          }
+        };
+
+        // Move down button
+        const moveDownBtn = containerDiv.createEl('button', { text: '↓' });
+        moveDownBtn.style.padding = '0.25rem 0.5rem';
+        moveDownBtn.disabled = i === this.plugin.settings.calendars.length - 1;
+        moveDownBtn.onclick = async () => {
+          if (i < this.plugin.settings.calendars.length - 1) {
+            [this.plugin.settings.calendars[i], this.plugin.settings.calendars[i + 1]] = [
+              this.plugin.settings.calendars[i + 1],
+              this.plugin.settings.calendars[i],
+            ];
+            await this.plugin.saveSettings();
+            this.display();
+          }
+        };
+
+        // Delete button
+        const deleteBtn = containerDiv.createEl('button', { text: '✕' });
+        deleteBtn.style.padding = '0.25rem 0.5rem';
+        deleteBtn.onclick = async () => {
+          this.plugin.settings.calendars.splice(i, 1);
+          await this.plugin.saveSettings();
+          this.display();
+        };
+      }
+    }
+
+    // Add calendar button
+    new Setting(containerEl)
+      .addButton((btn) =>
+        btn.setButtonText('+ Add Calendar').onClick(async () => {
+          this.plugin.settings.calendars.push({
+            id: 'primary',
+            label: `Calendar ${this.plugin.settings.calendars.length + 1}`,
+          });
+          await this.plugin.saveSettings();
+          this.display();
+        })
       );
   }
 
