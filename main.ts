@@ -12,6 +12,7 @@ interface GoogleCalendarSettings {
   accessToken: string;
   accessTokenExpiry: number; // timestamp in ms
   calendars: Calendar[]; // Array of calendars to sync
+  timezoneOffset: number; // UTC offset in hours (e.g., -5 for EST, 1 for CET)
 }
 
 const DEFAULT_SETTINGS: GoogleCalendarSettings = {
@@ -21,6 +22,7 @@ const DEFAULT_SETTINGS: GoogleCalendarSettings = {
   accessToken: '',
   accessTokenExpiry: 0,
   calendars: [{ id: 'primary', label: 'Primary Calendar' }],
+  timezoneOffset: 0,
 };
 
 export default class GoogleCalendarPlugin extends Plugin {
@@ -113,10 +115,27 @@ export default class GoogleCalendarPlugin extends Plugin {
       return;
     }
 
-    // Build time bounds for the entire day (UTC)
-    const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD
-    const timeMin = `${dateStr}T00:00:00Z`;
-    const timeMax = `${dateStr}T23:59:59Z`;
+    // Build time bounds for the entire day in system timezone
+    // Convert the local date to UTC boundaries considering timezone offset
+    const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD in UTC
+    
+    // Create a date at midnight in the system's local timezone
+    // timeMin: start of day in local timezone, converted to UTC
+    // timeMax: end of day in local timezone, converted to UTC
+    const offset = this.settings.timezoneOffset * 60 * 60 * 1000; // Convert hours to milliseconds
+    
+    // Midnight in local timezone (in UTC terms)
+    const midnightLocal = new Date(date);
+    midnightLocal.setUTCHours(0, 0, 0, 0);
+    midnightLocal.setTime(midnightLocal.getTime() - offset);
+    
+    // 23:59:59 in local timezone (in UTC terms)
+    const endOfDayLocal = new Date(date);
+    endOfDayLocal.setUTCHours(23, 59, 59, 999);
+    endOfDayLocal.setTime(endOfDayLocal.getTime() - offset);
+    
+    const timeMin = midnightLocal.toISOString();
+    const timeMax = endOfDayLocal.toISOString();
 
     try {
       // Fetch events from all calendars
@@ -287,6 +306,22 @@ class GoogleCalendarSettingTab extends PluginSettingTab {
         this.plugin.settings.refreshToken
           ? `✅ Authenticated (expires ${new Date(this.plugin.settings.accessTokenExpiry).toLocaleString()})`
           : '❌ Not authenticated'
+      );
+
+    new Setting(containerEl)
+      .setName('Timezone Offset (hours)')
+      .setDesc('UTC offset for event times (e.g., -5 for EST, -8 for PST, 0 for UTC)')
+      .addText((text) =>
+        text
+          .setPlaceholder('0')
+          .setValue(this.plugin.settings.timezoneOffset.toString())
+          .onChange(async (value) => {
+            const offset = parseFloat(value);
+            if (!isNaN(offset)) {
+              this.plugin.settings.timezoneOffset = offset;
+              await this.plugin.saveSettings();
+            }
+          })
       );
 
     // Calendars section
